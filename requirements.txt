@@ -1,0 +1,12 @@
+# harness
+openai>=1.40
+huggingface_hub>=0.24
+pyyaml
+# CADGenBench validity gate; build123d 0.10 + OCP 7.x is the stack the gate is written for
+# (OCP 8 renamed calls the gate uses)
+build123d==0.10.0
+cadquery-ocp-novtk<8
+numpy<2.4
+trimesh
+manifold3d
+scipy
