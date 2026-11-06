@@ -96,7 +96,7 @@ class MCPClient:
             {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "solidcraft-cadbench", "version": "0.1"},
+                "clientInfo": {"name": "solidcraft-cadbench", "version": "0.2"},
             },
             timeout=60,
         )

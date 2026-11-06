@@ -1,6 +1,6 @@
 """Download what a run needs: the CADGenBench fixture inputs and SolidCraft 0.40.
 
-    python fetch.py data   --tasks 101,102,204 --dest work/data
+    python fetch.py data   --tasks 101,102,218 --dest work/data
     python fetch.py solidcraft --series 0.40 --dest work/solidcraft   (prints the CLI path)
 """
 from __future__ import annotations
@@ -94,7 +94,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=["data", "solidcraft"])
     ap.add_argument("--dest", type=Path, required=True)
-    ap.add_argument("--tasks", default="101,102,204")
+    ap.add_argument("--tasks", default="101,102,218")
     ap.add_argument("--series", default="0.40")
     ap.add_argument("--tag", default=os.environ.get("SOLIDCRAFT_TAG") or None)
     a = ap.parse_args()

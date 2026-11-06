@@ -7,7 +7,7 @@ Goal: run the benchmark against a locally served model and hand back one tarball
    It installs everything into `./work` and needs no sudo. Don't install things system-wide.
 3. If preflight says the tool call failed, the server is missing its tool-call parser
    (vLLM: `--enable-auto-tool-choice --tool-call-parser <parser>`). Fix the server, not the harness.
-4. If the model has no image input, add `--no-vision` (drawing tasks are skipped).
+4. If the model has no image input, add `--no-vision` (drawing tasks are skipped and no images are sent).
 5. When it finishes, report the `results/<date>_<model>.tar.gz` path and paste `summary.md`.
 
 Don't edit the harness to make a task pass, don't change the prompts, and don't rerun a task just

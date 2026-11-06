@@ -5,7 +5,7 @@
 #
 # Everything is installed inside this folder (./work); nothing outside it is changed.
 # Options after --base-url/--model are passed to harness/run_bench.py (see README.md):
-#   --tasks 101,102,204   --task-timeout 600   --no-vision   --api-key KEY
+#   --tasks 101,102,218   --task-timeout 1800   --no-vision   --api-key KEY
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$PWD
@@ -15,7 +15,7 @@ mkdir -p "$WORK"
 CADGENBENCH_COMMIT=33304cf771fc5639144b1df9611e347251052cf8   # benchmark code for the validity gate
 SOLIDCRAFT_SERIES=${SOLIDCRAFT_SERIES:-0.40}                    # newest 0.40.x release, rc or final
 
-TASKS=101,102,204
+TASKS=101,102,218
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   [[ ${args[i]} == --tasks ]] && TASKS=${args[i+1]}

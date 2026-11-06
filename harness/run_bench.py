@@ -35,11 +35,13 @@ ROOT = HERE.parent
 
 # MCP tools the model does not get: the harness owns files and the design's
 # lifetime (export/save/open/new_design), and these are app-only.
+MODELING = re.compile(r'"(solid|surface)\.[a-z_.]+"')
 HIDDEN_TOOLS = {"export", "save", "open", "new_design", "crash_reports", "running", "pending"}
 
-MAX_TOOL_TEXT = 12_000      # characters of one tool result kept in the conversation
+MAX_TOOL_TEXT = 30_000      # characters of one tool result kept in the conversation
 KEEP_IMAGES = 2             # most recent rendered images kept in the conversation
 GATE_TIMEOUT_S = 240
+CUT_OFF_KEEP = 6_000       # characters of a cut-off reply kept so the model can continue
 
 SYSTEM_PROMPT = """\
 You are an expert mechanical CAD engineer. You build precise 3D solids in SolidCraft, a \
@@ -68,7 +70,18 @@ tangent contacts often produce invalid faces.
 - Do not leave sealed internal voids.
 - If a feature fails repeatedly, simplify it or leave it out; a valid simpler part beats an \
 invalid detailed one.
-- You have a hard time limit of {minutes:.0f} minutes for this task. Submit early, then improve.
+- You have a hard time limit of {minutes:.0f} minutes for this task. Each reply is limited to \
+{reply_tokens} tokens, and long deliberation uses up that time: think briefly, act in small steps, \
+call `submit` as soon as a first complete part exists, then improve it. Tool results show the time left.
+
+Editing an imported part (a STEP file already loaded in the design):
+- It has no feature history, so there is nothing to re-parameterize. Change its geometry directly.
+- Find features with `body_topology` (`faces: "cylinders"` is short; `faces: "all"` can be huge) and `screenshot`.
+- Use `solid.offset_face` or `solid.replace_face` to move faces, or add and remove material with \
+`solid.cylinder`, `solid.extrude` and similar using `operation: "join"` or `"cut"`.
+- Always pass `targets: ["<imported body name>"]`. Without it a join creates a separate body and \
+the edit does not touch the part.
+- If you cannot make the edit, say so with `finish`; do not submit the input unchanged as if it were edited.
 
 SolidCraft server notes:
 {instructions}
@@ -137,7 +150,7 @@ def mcp_text(result: dict) -> tuple[str, list[bytes]]:
 def clip(text: str, n: int = MAX_TOOL_TEXT) -> str:
     if len(text) <= n:
         return text
-    return text[:n] + f"\n... [{len(text) - n} more characters cut by the harness]"
+    return text[:n] + f"\n... [{len(text) - n} more characters cut by the harness; ask for a narrower result]"
 
 
 def mcp_tool_to_openai(tool: dict) -> dict:
@@ -290,7 +303,7 @@ def run_task(task: Task, args, client: OpenAI, out_dir: Path, reference: str) ->
     res: dict = {
         "task": task.id, "task_type": task.task_type, "started": now_iso(),
         "stopped_reason": None, "turns": 0, "llm_calls": [], "tool_calls": 0,
-        "tool_errors": 0, "submits": 0, "submit_results": [],
+        "tool_errors": 0, "submits": 0, "harness_exports": 0, "modeling_calls": 0, "submit_results": [],
     }
     img_counter = [0]
 
@@ -303,7 +316,8 @@ def run_task(task: Task, args, client: OpenAI, out_dir: Path, reference: str) ->
     mcp = MCPClient(args.solidcraft_cli, [tdir.resolve(), task.dir.resolve()], tdir / "solidcraft_stderr.log")
     try:
         mcp.initialize()
-        tools = [mcp_tool_to_openai(t) for t in mcp.list_tools() if t["name"] not in HIDDEN_TOOLS]
+        hidden = HIDDEN_TOOLS | ({"screenshot", "compare_picture"} if args.no_vision else set())
+        tools = [mcp_tool_to_openai(t) for t in mcp.list_tools() if t["name"] not in hidden]
         tools += EXTRA_TOOLS
         res["solidcraft"] = mcp.server_info
 
@@ -334,7 +348,7 @@ def run_task(task: Task, args, client: OpenAI, out_dir: Path, reference: str) ->
             )
 
         system = SYSTEM_PROMPT.format(
-            minutes=args.task_timeout / 60, instructions=mcp.instructions.strip(), reference=reference.strip()
+            minutes=args.task_timeout / 60, reply_tokens=args.max_tokens_per_call, instructions=mcp.instructions.strip(), reference=reference.strip()
         )
         user_text = task.description + setup_note
         if task.images:
@@ -379,10 +393,24 @@ def run_task(task: Task, args, client: OpenAI, out_dir: Path, reference: str) ->
             res["turns"] += 1
             res["llm_calls"].append(m)
             msg = out["message"]
+            cut_off = m.get("finish_reason") == "length" and not msg.get("tool_calls")
+            if cut_off:
+                res["cut_off_replies"] = res.get("cut_off_replies", 0) + 1
+                # Keep the end of what it worked out, so the next reply continues instead of restarting.
+                tail = (msg.get("content") or out["reasoning"] or "")[-CUT_OFF_KEEP:]
+                msg = {"role": "assistant", "content": tail or "(reply cut off)"}
+            elif msg.get("content") is None and not msg.get("tool_calls"):
+                msg = {"role": "assistant", "content": ""}
             messages.append(msg)
             log("assistant", content=msg.get("content"), reasoning=out["reasoning"], tool_calls=msg.get("tool_calls"), metrics=m)
 
             calls = msg.get("tool_calls") or []
+            if cut_off:
+                messages.append({"role": "user", "content": (
+                    f"Your reply hit the {args.max_tokens_per_call}-token limit before any tool call. The end of it is "
+                    "above. Do not start over: stop deliberating and make a tool call now, with what you have."
+                )})
+                continue
             if not calls:
                 idle_turns += 1
                 if idle_turns >= 2:
@@ -429,14 +457,24 @@ def run_task(task: Task, args, client: OpenAI, out_dir: Path, reference: str) ->
                     res["tool_errors"] += 1
                 saved = [save_png(p, f"{name}") for p in imgs]
                 log("tool", name=name, arguments=raw_args, is_error=is_err, ms=round((time.monotonic() - tc0) * 1000),
-                    result=clip(reply, 6000), images=saved)
-                note = f"\n[{len(imgs)} image(s) follow in the next message]" if imgs else ""
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": clip(reply) + note})
+                    result=clip(reply), images=saved)
+                if not is_err and name in ("batch", "execute") and MODELING.search(raw_args):
+                    res["modeling_calls"] = res.get("modeling_calls", 0) + 1
+                note = f"\n[{len(imgs)} image(s) follow in the next message]" if imgs and not args.no_vision else ""
+                left_s = max(0, int(deadline - time.monotonic()))
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": clip(reply) + note + f"\n[time left: {left_s // 60} min {left_s % 60} s]"})
                 for p in imgs:
                     pending_images.append((name, p))
                 if finished and res.get("stopped_reason") == "timeout_in_tool":
                     break
-            if pending_images and not finished:
+            elapsed = time.monotonic() - t0
+            if not finished and not res["submits"] and not res.get("nudged") and elapsed > args.task_timeout * 0.5:
+                res["nudged"] = True
+                messages.append({"role": "user", "content": (
+                    "Half the time is gone and nothing has been submitted. Finish a complete part and call `submit` now."
+                )})
+            if pending_images and not finished and not args.no_vision:
                 content = [{"type": "text", "text": "Images returned by your last tool call(s): "
                             + ", ".join(n for n, _ in pending_images)}]
                 content += [{"type": "image_url", "image_url": {"url": data_url(p)}} for _, p in pending_images]
@@ -475,7 +513,7 @@ def do_submit(mcp: MCPClient, args, output_step: Path, design_sc: Path, res: dic
     r = mcp.call("export", {"path": str(output_step.resolve()), "format": "step"}, timeout=left)
     text, _ = mcp_text(r)
     if r.get("isError") or not output_step.exists():
-        res["submit_results"].append({"final": final, "export_error": text[:2000], "gate": {"is_valid": False}})
+        res["submit_results"].append({"final": final, "export_error": text[:2000], "gate": {"is_valid": False, "nothing_exported": True}})
         return f"Export failed: {text}", True, []
     try:
         mcp.call("save", {"path": str(design_sc.resolve())}, timeout=left)
@@ -488,13 +526,13 @@ def do_submit(mcp: MCPClient, args, output_step: Path, design_sc: Path, res: dic
     except MCPError:
         pass
     imgs: list[bytes] = []
-    if not final:
+    if not final and not args.no_vision:
         try:
             shot = mcp.call("screenshot", {"view": "iso", "width": 640, "height": 480}, timeout=min(left, 120))
             imgs = mcp_text(shot)[1]
         except MCPError:
             pass
-    res["submits"] += 1
+    res["harness_exports" if final else "submits"] += 1
     res["submit_results"].append({"final": final, "t": now_iso(), "gate": gate})
     verdict = "PASSED" if gate.get("is_valid") else "FAILED (this part would score 0)"
     reply = (
@@ -598,12 +636,12 @@ def main() -> int:
     ap.add_argument("--base-url", required=True, help="OpenAI-compatible endpoint, e.g. http://localhost:8000/v1")
     ap.add_argument("--model", required=True, help="model name as the endpoint lists it")
     ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "none"))
-    ap.add_argument("--tasks", default="101,102,204", help="comma-separated fixture ids")
+    ap.add_argument("--tasks", default="101,102,218", help="comma-separated fixture ids")
     ap.add_argument("--data-dir", type=Path, default=ROOT / "work" / "data")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "results")
-    ap.add_argument("--task-timeout", type=float, default=600, help="seconds per task (default 600)")
+    ap.add_argument("--task-timeout", type=float, default=1800, help="seconds per task (default 1800)")
     ap.add_argument("--max-turns", type=int, default=80)
-    ap.add_argument("--max-tokens-per-call", type=int, default=16384)
+    ap.add_argument("--max-tokens-per-call", type=int, default=32768)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--no-vision", action="store_true", help="model has no image input: skip drawing tasks")
     ap.add_argument("--skip-preflight", action="store_true")
@@ -619,7 +657,7 @@ def main() -> int:
     print(f"results: {out_dir}", flush=True)
 
     run = {
-        "harness": "solidcraft-cadbench 0.1",
+        "harness": "solidcraft-cadbench 0.2",
         "started": now_iso(),
         "model": args.model,
         "base_url": args.base_url,
@@ -679,20 +717,26 @@ def summary_md(run: dict, results: list[dict]) -> str:
         f"# SolidCraft x CADGenBench: {run['model']}",
         "",
         f"- Started {run['started']}, finished {run.get('finished')}",
-        f"- SolidCraft {run.get('solidcraft', {}).get('version')}, endpoint {run['base_url']}",
+        f"- SolidCraft {run.get('solidcraft', {}).get('version')}, endpoint {run['base_url']}, harness {run['harness']}",
         f"- Preflight: {json.dumps(run.get('preflight'))}",
         "",
-        "| Task | Type | Stopped | Wall s | Turns | Submits | Gate | Decode tok/s (median) | TTFT s (median) | Completion tokens | Max prompt tokens | Tool errors |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Task | Type | Stopped | Wall s | Turns | Model submits | Modeling calls | Gate | Decode tok/s (median) | TTFT s (median) | Completion tokens | Max prompt tokens | Cut-off replies | Tool errors |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         g = r.get("final_gate") or {}
         s = r.get("summary") or {}
+        if r.get("stopped_reason") == "skipped_no_vision":
+            gate = "skipped"
+        elif g.get("nothing_exported") or not g:
+            gate = "nothing exported"
+        else:
+            gate = "PASS" if g.get("is_valid") else "FAIL"
         lines.append(
             f"| {r['task']} | {r.get('task_type', '')} | {r.get('stopped_reason')} | {r.get('wall_s', '')} | "
-            f"{r.get('turns', '')} | {r.get('submits', '')} | {'PASS' if g.get('is_valid') else 'FAIL'} | "
+            f"{r.get('turns', '')} | {r.get('submits', '')} | {r.get('modeling_calls', '')} | {gate} | "
             f"{s.get('decode_tok_s_median')} | {s.get('ttft_s_median')} | {s.get('completion_tokens_total')} | "
-            f"{s.get('prompt_tokens_max')} | {r.get('tool_errors', '')} |"
+            f"{s.get('prompt_tokens_max')} | {r.get('cut_off_replies', 0) if 'turns' in r else ''} | {r.get('tool_errors', '')} |"
         )
     lines += ["", "The gate is the benchmark's validity check only; accuracy scores need the private ground truth.", ""]
     return "\n".join(lines)

@@ -18,7 +18,7 @@ cd solidcraft-cadbench
 ./run.sh --base-url http://localhost:8000/v1 --model <model name as /v1/models lists it>
 ```
 
-That's all. It takes about 30 minutes at most (3 tasks, 10-minute limit each), plus a few minutes
+That's all. It takes 90 minutes at most (3 tasks, 30-minute limit each), plus a few minutes
 of setup on the first run. When it ends it prints the path of one file to send back:
 
 ```
@@ -35,7 +35,7 @@ Run it again for another model; each run gets its own results folder and tarball
    from GitHub, checked against its published SHA-256.
 2. Downloads the task inputs from the public
    [CADGenBench dataset](https://huggingface.co/datasets/HuggingAI4Engineering/cadgenbench-data)
-   (pinned revision, ODC-By): 101 and 102 are engineering drawings to model, 204 is a STEP part to edit.
+   (pinned revision, ODC-By): 101 and 102 are engineering drawings to model, 218 is a STEP part to edit.
 3. Checks the endpoint: one tool call and one test image. It stops if tool calls don't work.
 4. For each task, starts a fresh headless SolidCraft (`solidcraft-cli mcp --headless`), gives the
    model the benchmark's own task text plus the drawing (or the part already loaded), and lets it
@@ -49,12 +49,12 @@ Nothing is uploaded anywhere.
 
 | Option | Default | |
 |---|---|---|
-| `--tasks` | `101,102,204` | Any CADGenBench fixture ids |
-| `--task-timeout` | `600` | Seconds per task |
-| `--no-vision` | off | Skip drawing tasks, for text-only models |
+| `--tasks` | `101,102,218` | Any CADGenBench fixture ids |
+| `--task-timeout` | `1800` | Seconds per task |
+| `--no-vision` | off | For text-only models: skips drawing tasks and sends no images |
 | `--api-key` | `none` | If the endpoint needs one (or set `OPENAI_API_KEY`) |
-| `--temperature` | `0.6` | |
-| `--max-tokens-per-call` | `16384` | |
+| `--temperature` | `0.6` | Use `0` if your server only has a fast path without sampling |
+| `--max-tokens-per-call` | `32768` | |
 | `--max-turns` | `80` | Model calls per task |
 
 Environment: `SOLIDCRAFT_TAG=v0.40.0-rc.2` pins a SolidCraft release instead of taking the newest 0.40.
@@ -81,11 +81,18 @@ grows as the conversation does.
 The validity check is the benchmark's real gate, but the accuracy score needs the benchmark's
 private ground truth, so this harness can't produce a CADGenBench score.
 
+A cut-off reply (one that hits the per-reply token limit) keeps its last 6,000 characters in the
+conversation and the model is told to act. Tool results end with the time left, and a model that
+hasn't submitted at half time is reminded once. `Model submits` counts only the model's own `submit`
+calls; a part exported by the harness at the end shows up under `harness_exports` in `metrics.json`.
+
 ## Known limits
 
 - SolidCraft 0.40 uses its new solidcore kernel. Some STEP inputs don't import as closed solids
-  on it yet (fixtures 201, 206, 208 and 209 among the first ten editing tasks); the harness warns when
-  that happens, because any export of such a part fails the gate. The default edit task 204 imports cleanly.
+  on it yet (201, 206, 208, 209, 211, 212 and 224 of the 17 editing tasks tried); the harness warns
+  when that happens, because any export of such a part fails the gate. Most of the others import
+  closed but refuse booleans on rc.2 (`SMLib's check refuses the result`), so those edits can't be
+  done by adding or removing material. The default edit task 218 accepts them.
 - A SolidCraft call that runs past the task's time limit ends the task without a final export.
 
 ## License
